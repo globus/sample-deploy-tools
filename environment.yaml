@@ -1,0 +1,302 @@
+---
+
+Parameters:
+  # all possible environments
+  # used to create unique resource names across environments and disambiguate
+  # for administrators observing the components
+  Env:
+    Type: String
+    AllowedValues:
+      - sandbox
+      - integration
+      - test
+      - preview
+      - staging
+      - production
+
+Conditions:
+  # will configure database differently based on whether production or not
+  IsProduction: !Equals [!Ref Env, production]
+
+Resources:
+  # retain per-environment RDS instance logs for 90 days
+  DatabaseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/instance/rds-${Env}/postgresql"
+      RetentionInDays: 90
+
+  # retain Docker container logs for 90 days
+  # an ECS task may contain more than one container (as is the case here)
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "subscription-${Env}"
+      RetentionInDays: 90
+
+  # IAM role assumed by per-environment RDS instances
+  DatabaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "rds-${Env}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal: {Service: "rds.amazonaws.com"}
+
+  # security group that restricts access to the database
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow connections to database from application server
+      SecurityGroupIngress:
+        # allow access from the application container
+        - SourceSecurityGroupId: !Ref ServiceSecurityGroup
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+        # allow access from workstations connected via VPN
+        - SourceSecurityGroupId: sg-b07e6ec4
+          SourceSecurityGroupOwnerId: 123456789012
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+      VpcId: !ImportValue Main-VPC-VPCID
+
+  # encrypt data at rest via KMS
+  DatabaseKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Database storage encryption key
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Allow root account administration
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"}
+            Action: kms:*
+            Resource: "*"
+          - Sid: Allow RDS to encrypt/decrypt
+            Effect: Allow
+            Principal: {Service: rds.amazonaws.com}
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+
+  # friendly name for the KMS key defined above
+  DatabaseKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/rds/${Env}"
+      TargetKeyId: !Ref DatabaseKey
+
+  # subnet groups assigned to the RDS instance
+  DatabaseSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${Env} RDS subnet groups"
+      SubnetIds:
+        - !ImportValue Main-VPC-SubnetPriv1a
+        - !ImportValue Main-VPC-SubnetPriv1b
+
+  # randomly generated database master password
+  # this avoids having to include credentials in source code
+  DatabaseMasterPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "subscription/${Env}/db"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "globus"}'
+        GenerateStringKey: password
+        PasswordLength: 30
+        ExcludeCharacters: '/"@'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DependsOn: DatabaseMasterPassword
+    Properties:
+      DBInstanceIdentifier: !Sub "subscription-${Env}"
+      DBName: subscription
+      DBInstanceClass: db.t2.small
+      AllocatedStorage: 5
+      Engine: postgres
+      EngineVersion: 11.5
+      PreferredMaintenanceWindow: tue:08:00-tue:08:30
+      AutoMinorVersionUpgrade: false
+      MasterUsername: !Sub "{{resolve:secretsmanager:subscription/${Env}/db:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:subscription/${Env}/db:SecretString:password}}"
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+      KmsKeyId: !Ref DatabaseKey
+      MultiAZ: !If [IsProduction, true, false]
+      StorageEncrypted: true
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      DBSubnetGroupName: !Ref DatabaseSubnets
+      Tags:
+        - Key: Backup
+          Value: Daily
+
+  # TODO - comment
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub subscription-${Env}
+
+  # IAM role assumed by the ECS task (web proxy and application containers)
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ecs-task-${Env}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal: {Service: ecs-tasks.amazonaws.com}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: allow-subscription-db-secret
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              Effect: Allow
+              Action:
+                - secretsmanager:GetResourcePolicy
+                - secretsmanager:GetSecretValue
+                - secretsmanager:DescribeSecret
+                - secretsmanager:ListSecretVersionIds
+              # Resource: !Ref DatabaseMasterPassword
+              Resource: '*'
+
+  # web proxy and application
+  Task:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub subscription-${Env}
+      ContainerDefinitions:
+        - Name: proxy
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/subscription/proxy"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Sub "${AWS::Region}"
+              awslogs-group: !Sub "subscription-${Env}"
+              awslogs-create-group: true
+              awslogs-stream-prefix: proxy
+          PortMappings:
+            - ContainerPort: 443
+              Protocol: tcp
+        - Name: app
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/subscription/app"
+          Environment:
+            - Name: SUBSCRIPTION_ENVIRONMENT
+              Value: !Ref Env
+            - Name: RDS_ENDPOINT
+              Value: !GetAtt Database.Endpoint.Address
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Sub "subscription-${Env}"
+              awslogs-create-group: true
+              awslogs-stream-prefix: app
+          PortMappings:
+            - ContainerPort: 8443
+              Protocol: tcp
+      Cpu: 512
+      Memory: 4096
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref TaskRole
+      TaskRoleArn: !Ref TaskRole
+      RequiresCompatibilities:
+        - FARGATE
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow internal connections from Load Balancers
+      SecurityGroupIngress: 
+        - SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      VpcId: !ImportValue Main-VPC-VPCID
+
+  # an association between load balancers and containers
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerListener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref Task
+      LoadBalancers:
+        - ContainerName: proxy
+          ContainerPort: 443
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+          Subnets:
+            - !ImportValue Main-VPC-SubnetPriv1a
+            - !ImportValue Main-VPC-SubnetPriv1b
+
+  # allow access to port 443 from the world to the load balancers
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from Internet
+      SecurityGroupIngress: 
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      VpcId: !ImportValue Main-VPC-VPCID
+
+  LoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Port: 443
+      Protocol: HTTPS
+      HealthCheckPath: /status
+      VpcId: !ImportValue Main-VPC-VPCID
+
+  # NOTE:  validation record for certificate must be manually created by the
+  # administrator to allow the CloudFormation stack update to continue
+  LoadBalancerCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub "${Env}.subscription.globus.org"
+      ValidationMethod: DNS
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref LoadBalancerCertificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Env}"
+      Subnets:
+        - !ImportValue Main-VPC-SubnetPub1a
+        - !ImportValue Main-VPC-SubnetPub1b
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]

@@ -1,0 +1,15 @@
+---
+
+version: '3'
+
+services:
+  app:
+    build: .
+    container_name: app
+    network_mode: service:proxy
+
+  proxy:
+    container_name: proxy
+    build: nginx
+    ports:
+      - "8443:443"

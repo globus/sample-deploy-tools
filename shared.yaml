@@ -1,0 +1,76 @@
+---
+
+# this defines all resources that are shared between all environments
+
+Resources:
+  # Docker repository for the web proxy
+  ProxyRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: subscription/proxy
+
+  # Docker repository for the application code
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: subscription/app
+
+  # IAM role assumed by AWS Backup service
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: backup
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal: {Service: backup.amazonaws.com}
+          - Effect: Allow
+            Action: sts:AssumeRole
+            # IAM role used by the disaster recovery account
+            Principal: {AWS: "arn:aws:iam::123456789012:role/backup"}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+      Policies:
+        - PolicyName: backup-snapshots
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              Effect: Allow
+              Action:
+                - backup:ListRecoveryPointsByResource
+                - rds:ModifyDBSnapshotAttribute
+                - rds:DeleteDBSnapshot
+              Resource: "*"
+
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: Subscription
+
+  # backups are taken daily and kept for 90 days
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: Daily
+        BackupPlanRule:
+          - RuleName: Daily
+            ScheduleExpression: cron(0 6 * * ? *)
+            Lifecycle:
+              DeleteAfterDays: 90
+            TargetBackupVault: !Ref BackupVault
+
+  # any resource with a tag key of "Backup" and value "Daily" will be selected
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        IamRoleArn: !GetAtt BackupRole.Arn
+        ListOfTags:
+          - ConditionKey: Backup
+            ConditionType: STRINGEQUALS
+            ConditionValue: Daily
+        SelectionName: Daily
